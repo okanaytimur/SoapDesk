@@ -1,0 +1,16 @@
+# PyInstaller
+build/
+dist/
+*.manifest
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# SoapDesk yerel dosyalari
+.soapdesk.json
+soapdesk_history.xml
+*.xml.tmp
