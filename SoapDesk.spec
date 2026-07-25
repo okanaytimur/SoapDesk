@@ -10,7 +10,17 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Kullanilmayan modulleri disarida birak (~4 MB). Bu listedekiler test
+    # edildi; unicodedata (idna) ve decimal (zeep xsd tipleri) ZORUNLU, onlar
+    # cikarilirsa exe acilmaz.
+    excludes=[
+        'sqlite3', '_sqlite3',
+        'lxml.objectify', 'lxml.html', 'lxml.isoschematron', 'lxml.cssselect',
+        '_zstd', 'compression.zstd', 'zstandard',
+        'bz2', '_bz2', 'lzma', '_lzma',
+        'multiprocessing',
+        'unittest', 'doctest', 'pdb', 'pydoc',
+    ],
     noarchive=False,
     optimize=0,
 )
