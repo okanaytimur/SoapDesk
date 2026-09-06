@@ -16,6 +16,7 @@ Linux'ta gerekirse: apt install python3-tk
 import os
 import re
 import sys
+import bisect
 import json
 import queue
 import threading
@@ -23,6 +24,7 @@ import datetime as _dt
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from tkinter import font as tkfont
 
 try:
     import requests
@@ -356,6 +358,763 @@ class HistoryStore(object):
 # --------------------------------------------------------------------------
 # Arayuz
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# XML editoru: renklendirme, satir numarasi, arama, bicimlendirme
+# --------------------------------------------------------------------------
+PAL = {
+    'bg':        '#ffffff',   'fg':      '#1f2328',
+    'caret':     '#0969da',   'sel':     '#cfe3fb',
+    'curline':   '#f4f8fd',   'gutter':  '#f3f5f7',
+    'gutter_fg': '#a8b0bb',   'gutter_on': '#0969da',
+    'punct':     '#57606a',   'tag':     '#116329',
+    'prefix':    '#8250df',   'attr':    '#0550ae',
+    'attrprefix': '#8250df',  'value':   '#0a3069',
+    'comment':   '#6e7781',   'cdata':   '#953800',
+    'pi':        '#8250df',   'doctype': '#8250df',
+    'entity':    '#cf222e',   'pair':    '#daf2e3',
+    'find':      '#fff2b2',   'findcur': '#ffcf33',
+    'errline':   '#ffebe9',   'ok':      '#1a7f37',
+    'err':       '#cf222e',
+}
+INDENT = '  '
+MAX_HL = 400000                      # bu boyutun ustunde renklendirme kapanir
+
+_NM = r'[A-Za-z_][-A-Za-z0-9_.]*'
+_TOK = re.compile(
+    r'(?P<comment><!--.*?-->)'
+    r'|(?P<cdata><!\[CDATA\[.*?\]\]>)'
+    r'|(?P<pi><\?.*?\?>)'
+    r'|(?P<doctype><![A-Za-z].*?>)'
+    r'|(?P<tag></?' + _NM + r'(?::' + _NM + r')?'
+    r'(?:"[^"]*"|\'[^\']*\'|[^<>"\'])*>)'
+    r'|(?P<entity>&(?:\#[0-9]+|\#x[0-9A-Fa-f]+|' + _NM + r');)',
+    re.S)
+_HEAD = re.compile(r'^(</?)(?:(' + _NM + r'):)?(' + _NM + r')')
+_ATTR = re.compile(r'(?:(' + _NM + r'):)?(' + _NM + r')(\s*=\s*)'
+                   r'("[^"]*"|\'[^\']*\')')
+
+
+def format_xml(src):
+    """Tek satirlik XML'i okunur hale getir. Bozuksa exception firlatir."""
+    head = ''
+    body = src.strip()
+    m = re.match(r'<\?xml[^>]*\?>\s*', body)
+    if m:
+        head = m.group().strip() + '\n'
+        body = body[m.end():]
+    p = etree.XMLParser(remove_blank_text=True, resolve_entities=False,
+                        strip_cdata=False, huge_tree=True)
+    root = etree.fromstring(body.encode('utf-8'), p)
+    out = etree.tostring(root, pretty_print=True, encoding='unicode')
+    return head + out.rstrip('\n')
+
+
+def tag_stack(src):
+    """src icinde acik kalmis etiket adlarini sirayla dondur."""
+    st = []
+    for m in _TOK.finditer(src):
+        if m.lastgroup != 'tag':
+            continue
+        raw = m.group()
+        h = _HEAD.match(raw)
+        if not h:
+            continue
+        nm = (h.group(2) + ':' if h.group(2) else '') + h.group(3)
+        if raw.startswith('</'):
+            if nm in st:
+                while st and st.pop() != nm:
+                    pass
+        elif not raw.endswith('/>'):
+            st.append(nm)
+    return st
+
+
+class _ProxyText(tk.Text):
+    """Icerik/imlec degisimini olay olarak yayan Text."""
+
+    def __init__(self, *a, **kw):
+        tk.Text.__init__(self, *a, **kw)
+        self._orig = self._w + '_o'
+        self.tk.call('rename', self._w, self._orig)
+        self.tk.createcommand(self._w, self._proxy)
+
+    def _proxy(self, *args):
+        try:
+            res = self.tk.call((self._orig,) + args)
+        except tk.TclError as ex:
+            if 'tagged with' in str(ex) or 'bad text index' in str(ex):
+                return ''
+            raise
+        op = args[0] if args else ''
+        if op in ('insert', 'delete', 'replace') or \
+                (op == 'edit' and args[1:2] and args[1] in ('undo', 'redo')):
+            self.event_generate('<<Edited>>', when='tail')
+        elif op in ('xview', 'yview') or args[:3] == ('mark', 'set', 'insert'):
+            self.event_generate('<<Moved>>', when='tail')
+        return res
+
+
+class XmlEditor(ttk.Frame):
+    """Satir numarali, sozdizimi renklendirmeli kucuk XML editoru."""
+
+    TAGS = ('comment', 'cdata', 'pi', 'doctype', 'tag', 'prefix',
+            'attr', 'attrprefix', 'value', 'punct', 'entity')
+
+    def __init__(self, master, editable=True, validate=False, size=10):
+        ttk.Frame.__init__(self, master)
+        self.editable = editable
+        self.validate = validate
+        self.size = size
+        self._job = None
+        self._spans = []          # (bas, son, tur, ad) - etiket token'lari
+        self._starts = [0]
+        self._hits = []
+        self._hit = -1
+
+        self.font = tkfont.Font(family='Consolas', size=size)
+        self.ital = tkfont.Font(family='Consolas', size=size, slant='italic')
+
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self.gutter = tk.Canvas(self, width=42, bd=0, highlightthickness=0,
+                                bg=PAL['gutter'], takefocus=0)
+        self.gutter.grid(row=0, column=0, sticky='ns')
+
+        t = self.text = _ProxyText(
+            self, wrap='none', undo=editable, maxundo=-1, autoseparators=True,
+            font=self.font, bg=PAL['bg'], fg=PAL['fg'], bd=0,
+            highlightthickness=0, padx=6, pady=2,
+            insertbackground=PAL['caret'], insertwidth=2 if editable else 0,
+            selectbackground=PAL['sel'], selectforeground=PAL['fg'],
+            tabs=self.font.measure(INDENT))
+        t.grid(row=0, column=1, sticky='nsew')
+        vs = ttk.Scrollbar(self, orient='vertical', command=t.yview)
+        vs.grid(row=0, column=2, sticky='ns')
+        self.hs = ttk.Scrollbar(self, orient='horizontal', command=t.xview)
+        self.hs.grid(row=1, column=0, columnspan=3, sticky='ew')
+        t.configure(yscrollcommand=vs.set, xscrollcommand=self.hs.set)
+
+        self._build_find()
+        self._build_bar()
+        self._styles()
+        self._bind()
+        if not editable:
+            t.configure(state='disabled')
+        self._gutter()
+
+    # ---- gorunum
+    def _styles(self):
+        c = self.text.tag_configure
+        c('cur', background=PAL['curline'])
+        for n in self.TAGS:
+            c(n, foreground=PAL[n])
+        c('comment', foreground=PAL['comment'], font=self.ital)
+        c('meta', foreground=PAL['comment'])
+        c('errline', background=PAL['errline'])
+        c('pair', background=PAL['pair'])
+        c('find', background=PAL['find'])
+        c('findcur', background=PAL['findcur'])
+        self.text.tag_lower('cur')
+        for n in ('pair', 'find', 'findcur', 'sel'):
+            self.text.tag_raise(n)
+
+    def _build_bar(self):
+        bar = ttk.Frame(self)
+        bar.grid(row=3, column=0, columnspan=3, sticky='ew')
+        self.pos = ttk.Label(bar, text="Ln 1, Col 1", width=17, anchor='w')
+        self.pos.pack(side='left', padx=(4, 0))
+        self.note_lbl = ttk.Label(bar, text="", anchor='w',
+                                  foreground=PAL['comment'])
+        self.note_lbl.pack(side='left', fill='x', expand=True, padx=4)
+        self.wrap = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Sar", variable=self.wrap,
+                        command=self.toggle_wrap).pack(side='right')
+
+    def _build_find(self):
+        f = self.findbar = ttk.Frame(self)
+        f.grid(row=2, column=0, columnspan=3, sticky='ew')
+        f.grid_remove()
+        ttk.Label(f, text="Bul:").pack(side='left', padx=(4, 2))
+        self.qe = ttk.Entry(f, width=30)
+        self.qe.pack(side='left')
+        self.qe.bind('<KeyRelease>', self._find_now)
+        self.qe.bind('<Return>', lambda e: self._step(1))
+        self.qe.bind('<Shift-Return>', lambda e: self._step(-1))
+        self.qe.bind('<Escape>', lambda e: self.hide_find())
+        ttk.Button(f, text="<", width=3,
+                   command=lambda: self._step(-1)).pack(side='left', padx=2)
+        ttk.Button(f, text=">", width=3,
+                   command=lambda: self._step(1)).pack(side='left')
+        self.case = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Aa", variable=self.case,
+                        command=self._find_now).pack(side='left', padx=4)
+        self.fcount = ttk.Label(f, text="", width=12, anchor='w')
+        self.fcount.pack(side='left')
+        ttk.Button(f, text="Kapat",
+                   command=self.hide_find).pack(side='right', padx=2)
+
+    # ---- baglantilar
+    def _bind(self):
+        t = self.text
+        t.bind('<<Edited>>', self._on_edit)
+        t.bind('<<Moved>>', self._on_move)
+        t.bind('<Configure>', lambda e: self._gutter())
+        t.bind('<Expose>', lambda e: self._gutter())
+        self.gutter.bind('<Configure>', lambda e: self._gutter())
+        t.bind('<Control-f>', lambda e: self.show_find())
+        t.bind('<Control-F>', lambda e: self.do_format())
+        t.bind('<Escape>', lambda e: self.hide_find())
+        t.bind('<Control-a>', self._select_all)
+        t.bind('<Control-plus>', lambda e: self.zoom(1))
+        t.bind('<Control-equal>', lambda e: self.zoom(1))
+        t.bind('<Control-minus>', lambda e: self.zoom(-1))
+        t.bind('<Control-MouseWheel>',
+               lambda e: self.zoom(1 if e.delta > 0 else -1))
+        t.bind('<Button-3>', self._menu)
+        if self.editable:
+            t.bind('<Return>', self._on_return)
+            t.bind('<Tab>', self._on_tab)
+            t.bind('<Shift-Tab>', self._on_untab)
+            t.bind('<ISO_Left_Tab>', self._on_untab)
+            t.bind('<BackSpace>', self._on_bs)
+            t.bind('<greater>', self._on_gt)
+            t.bind('<slash>', self._on_slash)
+            t.bind('<Control-slash>', self._on_comment)
+            t.bind('<Control-d>', self._dup_line)
+            t.bind('<Control-y>', self._redo)
+
+        self.pop = tk.Menu(self, tearoff=0)
+        if self.editable:
+            self.pop.add_command(label="Geri al", command=self._undo)
+            self.pop.add_command(label="Yinele", command=self._redo)
+            self.pop.add_separator()
+            self.pop.add_command(
+                label="Kes", command=lambda: t.event_generate('<<Cut>>'))
+        self.pop.add_command(label="Kopyala",
+                             command=lambda: t.event_generate('<<Copy>>'))
+        if self.editable:
+            self.pop.add_command(
+                label="Yapistir",
+                command=lambda: t.event_generate('<<Paste>>'))
+        self.pop.add_separator()
+        self.pop.add_command(label="Bicimle  (Ctrl+Shift+F)",
+                             command=self.do_format)
+        self.pop.add_command(label="Bul  (Ctrl+F)", command=self.show_find)
+        self.pop.add_command(label="Tumunu sec",
+                             command=lambda: self._select_all(None))
+
+    def _menu(self, e):
+        try:
+            self.pop.tk_popup(e.x_root, e.y_root)
+        finally:
+            self.pop.grab_release()
+        return 'break'
+
+    def _undo(self, _e=None):
+        try:
+            self.text.edit_undo()
+        except tk.TclError:
+            pass
+        return 'break'
+
+    def _redo(self, _e=None):
+        try:
+            self.text.edit_redo()
+        except tk.TclError:
+            pass
+        return 'break'
+
+    # ---- disari acilan kucuk API (tk.Text ile uyumlu)
+    def get(self, a='1.0', b='end-1c'):
+        return self.text.get(a, b)
+
+    def insert(self, where, s, *tags):
+        return self._rw(self.text.insert, where, s, *tags)
+
+    def delete(self, a, b=None):
+        return self._rw(self.text.delete, a, b)
+
+    def edit_reset(self):
+        try:
+            self.text.edit_reset()
+        except tk.TclError:
+            pass
+
+    def focus_set(self):
+        self.text.focus_set()
+
+    def set_text(self, s, meta=0):
+        """Icerigi tumden degistir; meta = ustteki N satir 'baslik' sayilir."""
+        self.text.tag_remove('meta', '1.0', 'end')
+        self._rw(self.text.delete, '1.0', 'end')
+        self._rw(self.text.insert, '1.0', s)
+        self.edit_reset()
+        self.text.mark_set('insert', '1.0')
+        self.text.see('1.0')
+        if meta:
+            self.text.tag_add('meta', '1.0', '%d.0' % (meta + 1))
+        self.highlight_now()
+
+    def _rw(self, fn, *a):
+        """Salt-okunur editorde yazma islemi icin state'i gecici ac."""
+        if not self.editable:
+            self.text.configure(state='normal')
+        try:
+            return fn(*[x for x in a if x is not None])
+        finally:
+            if not self.editable:
+                self.text.configure(state='disabled')
+
+    def note(self, msg, kind=''):
+        self.note_lbl.configure(
+            text=msg,
+            foreground={'ok': PAL['ok'], 'err': PAL['err']}.get(
+                kind, PAL['comment']))
+
+    # ---- olaylar
+    def _on_edit(self, _e=None):
+        self._gutter()
+        if self._job:
+            self.after_cancel(self._job)
+        self._job = self.after(160, self._highlight)
+
+    def _on_move(self, _e=None):
+        self._gutter()
+        self._curline()
+        i = self.text.index('insert').split('.')
+        self.pos.configure(text="Ln %s, Col %d" % (i[0], int(i[1]) + 1))
+        if self._job is None:
+            self._pair()
+
+    def _curline(self):
+        self.text.tag_remove('cur', '1.0', 'end')
+        if self.editable:
+            self.text.tag_add('cur', 'insert linestart', 'insert lineend+1c')
+
+    # ---- satir numaralari
+    def _gutter(self):
+        g = self.gutter
+        g.delete('all')
+        t = self.text
+        try:
+            cur = int(t.index('insert').split('.')[0])
+            total = int(t.index('end-1c').split('.')[0])
+        except (tk.TclError, ValueError):
+            return
+        w = g.winfo_width()
+        if w < 10:                       # henuz yerlesmemis
+            return
+        g.create_line(w - 1, 0, w - 1, g.winfo_height(), fill=PAL['sel'])
+        i = t.index('@0,0')
+        seen = 0
+        while True:
+            d = t.dlineinfo(i)
+            if d is None:
+                break
+            ln = int(i.split('.')[0])
+            if ln != seen:
+                seen = ln
+                g.create_text(w - 7, d[1], anchor='ne', text=str(ln),
+                              font=self.font,
+                              fill=PAL['gutter_on'] if ln == cur
+                              else PAL['gutter_fg'])
+            nxt = t.index('%s+1line linestart' % i)
+            if nxt == i:
+                break
+            i = nxt
+        need = max(38, 16 + self.font.measure('0') * len(str(total)))
+        if need != int(g.cget('width')):
+            g.configure(width=need)
+
+    # ---- renklendirme
+    def highlight_now(self):
+        if self._job:
+            self.after_cancel(self._job)
+            self._job = None
+        self._highlight()
+
+    def _idx(self, off):
+        i = bisect.bisect_right(self._starts, off) - 1
+        return '%d.%d' % (i + 1, off - self._starts[i])
+
+    def _highlight(self):
+        self._job = None
+        t = self.text
+        src = t.get('1.0', 'end-1c')
+        for n in self.TAGS:
+            t.tag_remove(n, '1.0', 'end')
+        t.tag_remove('errline', '1.0', 'end')
+        t.tag_remove('pair', '1.0', 'end')
+        self._spans = []
+        if not src.strip():
+            self.note("")
+            return
+        if len(src) > MAX_HL:
+            self.note("Buyuk belge (%d KB) - renklendirme kapali"
+                      % (len(src) // 1024))
+            return
+
+        starts = [0]
+        p = src.find('\n')
+        while p >= 0:
+            starts.append(p + 1)
+            p = src.find('\n', p + 1)
+        self._starts = starts
+
+        buf = {}
+
+        def add(name, a, b):
+            if b > a:
+                buf.setdefault(name, []).extend((self._idx(a), self._idx(b)))
+
+        for m in _TOK.finditer(src):
+            kind = m.lastgroup
+            s, e = m.span()
+            if kind == 'tag':
+                self._paint_tag(src, s, e, add)
+            else:
+                add(kind, s, e)
+        for name, spans in buf.items():
+            t.tag_add(name, *spans)
+
+        if self.validate:
+            self._check(src)
+        self._pair()
+
+    def _paint_tag(self, src, s, e, add):
+        raw = src[s:e]
+        tail = 2 if raw.endswith('/>') else 1
+        add('punct', e - tail, e)
+        h = _HEAD.match(raw)
+        if not h:
+            add('punct', s, s + 1)
+            return
+        add('punct', s, s + h.end(1))
+        pos = h.end(1)
+        if h.group(2):
+            add('prefix', s + h.start(2), s + h.end(2) + 1)
+            pos = h.end(2) + 1
+        add('tag', s + pos, s + h.end(3))
+        nm = (h.group(2) + ':' if h.group(2) else '') + h.group(3)
+        kind = ('close' if raw.startswith('</')
+                else 'self' if raw.endswith('/>') else 'open')
+        self._spans.append((s, e, kind, nm))
+        for a in _ATTR.finditer(raw, h.end(3), len(raw) - tail):
+            if a.group(1):
+                add('attrprefix', s + a.start(1), s + a.end(1) + 1)
+            add('attr', s + a.start(2), s + a.end(2))
+            add('punct', s + a.start(3), s + a.end(3))
+            add('value', s + a.start(4), s + a.end(4))
+
+    def _check(self, src):
+        try:
+            etree.fromstring(src.encode('utf-8'),
+                             etree.XMLParser(resolve_entities=False,
+                                             huge_tree=True))
+            self.note("XML gecerli", 'ok')
+        except etree.XMLSyntaxError as ex:
+            ln = getattr(ex, 'lineno', 0) or 0
+            msg = str(ex).split(', line ')[0]
+            if ln:
+                try:
+                    self.text.tag_add('errline', '%d.0' % ln, '%d.end' % ln)
+                except tk.TclError:
+                    pass
+                self.note("Satir %d: %s" % (ln, msg), 'err')
+            else:
+                self.note(msg, 'err')
+        except Exception as ex:
+            self.note(str(ex), 'err')
+
+    # ---- acilis/kapanis etiket esleme
+    def _pair(self):
+        t = self.text
+        t.tag_remove('pair', '1.0', 'end')
+        if not self._spans:
+            return
+        off = len(t.get('1.0', 'insert'))
+        hit = None
+        for k, sp in enumerate(self._spans):
+            if sp[0] <= off <= sp[1]:
+                hit = k
+                break
+            if sp[0] > off:
+                break
+        if hit is None:
+            return
+        s, e, kind, nm = self._spans[hit]
+        mate, depth = None, 0
+        if kind == 'open':
+            for sp in self._spans[hit + 1:]:
+                if sp[3] != nm:
+                    continue
+                if sp[2] == 'open':
+                    depth += 1
+                elif sp[2] == 'close':
+                    if depth == 0:
+                        mate = sp
+                        break
+                    depth -= 1
+        elif kind == 'close':
+            for sp in reversed(self._spans[:hit]):
+                if sp[3] != nm:
+                    continue
+                if sp[2] == 'close':
+                    depth += 1
+                elif sp[2] == 'open':
+                    if depth == 0:
+                        mate = sp
+                        break
+                    depth -= 1
+        if mate is None:
+            return
+        try:
+            t.tag_add('pair', self._idx(s), self._idx(e))
+            t.tag_add('pair', self._idx(mate[0]), self._idx(mate[1]))
+        except tk.TclError:
+            pass
+
+    # ---- duzenleme kolayliklari
+    def _select_all(self, _e):
+        self.text.tag_add('sel', '1.0', 'end-1c')
+        return 'break'
+
+    def _line_indent(self, line):
+        return re.match(r'[ \t]*', line).group()
+
+    def _on_return(self, _e):
+        t = self.text
+        before = t.get('insert linestart', 'insert')
+        after = t.get('insert', 'insert lineend')
+        ind = self._line_indent(before)
+        last = None
+        for last in _TOK.finditer(before):
+            pass
+        opens = bool(last and last.lastgroup == 'tag'
+                     and last.end() == len(before.rstrip())
+                     and not last.group().startswith('</')
+                     and not last.group().endswith('/>'))
+        closes = after.lstrip().startswith('</')
+        t.edit_separator()
+        if opens and closes:
+            t.insert('insert', '\n' + ind + INDENT + '\n' + ind)
+            t.mark_set('insert', 'insert-%dc' % (len(ind) + 1))
+        elif opens:
+            t.insert('insert', '\n' + ind + INDENT)
+        else:
+            t.insert('insert', '\n' + ind)
+        t.see('insert')
+        return 'break'
+
+    def _sel_lines(self):
+        r = self.text.tag_ranges('sel')
+        if not r:
+            return None
+        a = int(str(r[0]).split('.')[0])
+        last = str(r[1])
+        b = int(last.split('.')[0])
+        if last.endswith('.0') and b > a:
+            b -= 1
+        return a, b
+
+    def _on_tab(self, _e):
+        t = self.text
+        rng = self._sel_lines()
+        t.edit_separator()
+        if rng:
+            for ln in range(rng[0], rng[1] + 1):
+                t.insert('%d.0' % ln, INDENT)
+            t.tag_add('sel', '%d.0' % rng[0], '%d.end' % rng[1])
+        else:
+            t.insert('insert', INDENT)
+        return 'break'
+
+    def _on_untab(self, _e):
+        t = self.text
+        rng = self._sel_lines() or (int(t.index('insert').split('.')[0]),) * 2
+        t.edit_separator()
+        for ln in range(rng[0], rng[1] + 1):
+            head = t.get('%d.0' % ln, '%d.%d' % (ln, len(INDENT)))
+            n = len(head) - len(head.lstrip(' '))
+            if n:
+                t.delete('%d.0' % ln, '%d.%d' % (ln, n))
+        return 'break'
+
+    def _on_bs(self, _e):
+        t = self.text
+        if t.tag_ranges('sel'):
+            return
+        before = t.get('insert linestart', 'insert')
+        if before and not before.strip() and len(before) % len(INDENT) == 0:
+            t.delete('insert-%dc' % len(INDENT), 'insert')
+            return 'break'
+
+    def _on_gt(self, _e):
+        """'>' yazilinca acik etiketi kendiliginden kapat."""
+        t = self.text
+        if not t.compare('insert', '==', 'insert lineend'):
+            return
+        line = t.get('insert linestart', 'insert')
+        i = line.rfind('<')
+        if i < 0:
+            return
+        frag = line[i:]
+        if frag[1:2] in ('/', '!', '?') or frag.endswith('/') or '>' in frag:
+            return
+        m = re.match(r'<((?:' + _NM + r':)?' + _NM + r')', frag)
+        if not m:
+            return
+        t.edit_separator()
+        t.insert('insert', '></%s>' % m.group(1))
+        t.mark_set('insert', 'insert-%dc' % (len(m.group(1)) + 3))
+        return 'break'
+
+    def _on_slash(self, _e):
+        """'</' yazilinca en yakin acik etiketi tamamla."""
+        t = self.text
+        head = t.get('1.0', 'insert')
+        if not head.endswith('<'):
+            return
+        st = tag_stack(head[:-1])
+        if not st:
+            return
+        t.edit_separator()
+        t.insert('insert', '/%s>' % st[-1])
+        return 'break'
+
+    def _on_comment(self, _e):
+        t = self.text
+        rng = self._sel_lines() or (int(t.index('insert').split('.')[0]),) * 2
+        a, b = rng
+        blk = t.get('%d.0' % a, '%d.end' % b)
+        t.edit_separator()
+        s = blk.strip()
+        if s.startswith('<!--') and s.endswith('-->'):
+            new = blk.replace('<!--', '', 1)
+            i = new.rfind('-->')
+            new = new[:i] + new[i + 3:]
+            new = '\n'.join(x.rstrip() for x in new.splitlines())
+        else:
+            ind = self._line_indent(blk)
+            new = ind + '<!--' + blk[len(ind):] + '-->'
+        t.delete('%d.0' % a, '%d.end' % b)
+        t.insert('%d.0' % a, new)
+        return 'break'
+
+    def _dup_line(self, _e):
+        t = self.text
+        line = t.get('insert linestart', 'insert lineend')
+        t.edit_separator()
+        t.insert('insert lineend', '\n' + line)
+        return 'break'
+
+    # ---- bicimlendirme
+    def do_format(self, quiet=False):
+        src = self.get()
+        if not src.strip():
+            return False
+        i = src.find('<')
+        if i < 0:
+            return False
+        head, body = src[:i], src[i:]
+        try:
+            out = format_xml(body)
+        except Exception as ex:
+            if not quiet:
+                self.note("Bicimlenemedi: %s" % str(ex).split(', line ')[0],
+                          'err')
+            return False
+        self.set_text(head + out, meta=head.count('\n'))
+        if not quiet:
+            self.note("Bicimlendi.", 'ok')
+        return True
+
+    def toggle_wrap(self):
+        on = self.wrap.get()
+        self.text.configure(wrap='word' if on else 'none')
+        if on:
+            self.hs.grid_remove()
+        else:
+            self.hs.grid()
+        self._gutter()
+
+    def zoom(self, d):
+        self.size = max(7, min(30, self.size + d))
+        self.font.configure(size=self.size)
+        self.ital.configure(size=self.size)
+        self.text.configure(tabs=self.font.measure(INDENT))
+        self._gutter()
+        return 'break'
+
+    # ---- arama
+    def show_find(self):
+        self.findbar.grid()
+        try:
+            sel = self.text.get('sel.first', 'sel.last')
+            if sel and '\n' not in sel:
+                self.qe.delete(0, 'end')
+                self.qe.insert(0, sel)
+        except tk.TclError:
+            pass
+        self.qe.focus_set()
+        self.qe.selection_range(0, 'end')
+        self._find_now()
+        return 'break'
+
+    def hide_find(self):
+        self.findbar.grid_remove()
+        self.text.tag_remove('find', '1.0', 'end')
+        self.text.tag_remove('findcur', '1.0', 'end')
+        self._hits = []
+        self.text.focus_set()
+        return 'break'
+
+    def _find_now(self, _e=None):
+        t = self.text
+        t.tag_remove('find', '1.0', 'end')
+        t.tag_remove('findcur', '1.0', 'end')
+        pat = self.qe.get()
+        self._hits, self._hit = [], -1
+        if not pat:
+            self.fcount.configure(text="")
+            return
+        pos = '1.0'
+        while True:
+            pos = t.search(pat, pos, stopindex='end',
+                           nocase=not self.case.get())
+            if not pos:
+                break
+            end = '%s+%dc' % (pos, len(pat))
+            self._hits.append((pos, end))
+            t.tag_add('find', pos, end)
+            pos = end
+        self.fcount.configure(text="%d sonuc" % len(self._hits))
+        if self._hits:
+            self._step(1, from_cursor=True)
+
+    def _step(self, d, from_cursor=False):
+        t = self.text
+        if not self._hits:
+            return 'break'
+        if from_cursor:
+            cur = t.index('insert')
+            self._hit = 0
+            for k, (a, _b) in enumerate(self._hits):
+                if t.compare(a, '>=', cur):
+                    self._hit = k
+                    break
+        else:
+            self._hit = (self._hit + d) % len(self._hits)
+        a, b = self._hits[self._hit]
+        t.tag_remove('findcur', '1.0', 'end')
+        t.tag_add('findcur', a, b)
+        t.see(a)
+        self.fcount.configure(text="%d / %d" % (self._hit + 1,
+                                                len(self._hits)))
+        return 'break'
+
+
 class App(ttk.Frame):
     def __init__(self, master):
         super().__init__(master, padding=6)
@@ -437,6 +1196,9 @@ class App(ttk.Frame):
         ttk.Label(bar, text="Endpoint:").pack(side='left')
         self.addr = ttk.Entry(bar)
         self.addr.pack(side='left', fill='x', expand=True, padx=4)
+        ttk.Button(bar, text="Bicimle",
+                   command=lambda: self.body.do_format())\
+            .pack(side='left', padx=(0, 4))
         self.btn_regen = ttk.Button(bar, text="Sablonu yenile",
                                     command=self.regen, state='disabled')
         self.btn_regen.pack(side='left', padx=(0, 4))
@@ -447,22 +1209,27 @@ class App(ttk.Frame):
         hb = ttk.Frame(req)
         hb.pack(fill='x', pady=(4, 0))
         ttk.Label(hb, text="Headers:").pack(side='left', anchor='n')
-        self.hdrs = tk.Text(hb, height=2, wrap='none', undo=True)
+        self.hdrs = tk.Text(hb, height=2, wrap='none', undo=True,
+                            font=('Consolas', 9))
         self.hdrs.pack(side='left', fill='x', expand=True, padx=4)
 
-        self.body = tk.Text(req, wrap='none', undo=True, font=('Consolas', 10))
-        rvs = ttk.Scrollbar(req, orient='vertical', command=self.body.yview)
-        self.body.configure(yscrollcommand=rvs.set)
-        rvs.pack(side='right', fill='y')
+        self.body = XmlEditor(req, editable=True, validate=True)
         self.body.pack(fill='both', expand=True, pady=(4, 0))
         right.add(req, weight=3)
 
         res = ttk.Labelframe(right, text="Response", padding=4)
-        self.resp = tk.Text(res, wrap='none', font=('Consolas', 10))
-        pvs = ttk.Scrollbar(res, orient='vertical', command=self.resp.yview)
-        self.resp.configure(yscrollcommand=pvs.set)
-        pvs.pack(side='right', fill='y')
-        self.resp.pack(fill='both', expand=True)
+        rbar = ttk.Frame(res)
+        rbar.pack(fill='x')
+        self.autofmt = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rbar, text="Yanit geldiginde bicimle",
+                        variable=self.autofmt).pack(side='left')
+        ttk.Button(rbar, text="Bicimle",
+                   command=lambda: self.resp.do_format())\
+            .pack(side='left', padx=4)
+        ttk.Button(rbar, text="Bul",
+                   command=lambda: self.resp.show_find()).pack(side='left')
+        self.resp = XmlEditor(res, editable=False)
+        self.resp.pack(fill='both', expand=True, pady=(4, 0))
         right.add(res, weight=2)
 
         pw.add(right, weight=4)
@@ -529,9 +1296,7 @@ class App(ttk.Frame):
             self.drafts[self.cur] = self._snapshot()
 
     def _show(self, body, addr, headers):
-        self.body.delete('1.0', 'end')
-        self.body.insert('1.0', body)
-        self.body.edit_reset()
+        self.body.set_text(body)
         self.addr.delete(0, 'end')
         self.addr.insert(0, addr or '')
         self.hdrs.delete('1.0', 'end')
@@ -575,9 +1340,9 @@ class App(ttk.Frame):
         key = (x['service'], x['port'], x['operation'])
         self.cur = key if all(key) else self.cur
         self._show(x['envelope'], x['endpoint'], x['headers'])
-        self.resp.delete('1.0', 'end')
-        if x.get('response'):
-            self.resp.insert('1.0', x['response'])
+        self.resp.set_text(x.get('response') or '')
+        if x.get('response') and self.autofmt.get():
+            self.resp.do_format(quiet=True)
         self.say("Gecmisten yuklendi: %s  (%s)" % (x['operation'], x['ts']))
 
     def pick_hist_file(self):
@@ -714,7 +1479,7 @@ class App(ttk.Frame):
         v = self.verify.get()
         self.btn_send.config(state='disabled')
         self.say("Gonderiliyor...")
-        self.resp.delete('1.0', 'end')
+        self.resp.set_text('')
         t0 = _dt.datetime.now()
 
         def work():
@@ -741,15 +1506,18 @@ class App(ttk.Frame):
     def _got(self, addr, hdr, xml, code, rh, body, t0):
         self.btn_send.config(state='normal')
         ms = self._record(addr, hdr, xml, code, body, t0)
-        self.resp.insert('1.0', "HTTP %s   %s\n%s\n%s"
-                         % (code, rh.get('Content-Type', ''), '-' * 60, body))
+        self.resp.set_text("HTTP %s   %s\n%s\n%s"
+                           % (code, rh.get('Content-Type', ''), '-' * 60,
+                              body), meta=2)
+        if self.autofmt.get():
+            self.resp.do_format(quiet=True)
         self.say("HTTP %s   %d ms   %d byte" % (code, ms, len(body)))
 
     def _sendfail(self, addr, hdr, xml, ex, t0):
         self.btn_send.config(state='normal')
         msg = "%s: %s" % (type(ex).__name__, ex)
         self._record(addr, hdr, xml, 'ERR', msg, t0)
-        self.resp.insert('1.0', msg)
+        self.resp.set_text(msg)
         self.say("Gonderim hatasi.")
 
     # ---- tek dosya kaydet/ac
@@ -766,8 +1534,7 @@ class App(ttk.Frame):
                                                   ('Tumu', '*.*')])
         if p:
             with open(p, encoding='utf-8') as f:
-                self.body.delete('1.0', 'end')
-                self.body.insert('1.0', f.read())
+                self.body.set_text(f.read())
             self.btn_send.config(state='normal')
             self.say("Acildi: %s" % p)
 
